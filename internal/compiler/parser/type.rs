@@ -90,7 +90,6 @@ pub fn parse_struct_declaration<P: Parser>(p: &mut P, checkpoint: Option<P::Chec
     }
 
     if p.peek().kind() == SyntaxKind::ColonEqual {
-        p.warning("':=' to declare a struct is deprecated. Remove the ':='");
         p.consume();
     }
 

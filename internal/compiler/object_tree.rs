@@ -632,11 +632,23 @@ pub struct Component {
     pub from_library: Cell<bool>,
 }
 
-/// Reports a component or global declared with ':=', which is an error from edition 1.20.
-fn check_legacy_declaration(node: &syntax_nodes::Component, diag: &mut BuildDiagnostics) {
+/// Reports a component, global, or struct declared with ':=', which is an error from edition 1.20.
+fn check_legacy_declaration(node: &SyntaxNode, diag: &mut BuildDiagnostics) {
     let Some(colon_equal) = node.child_token(SyntaxKind::ColonEqual) else { return };
     let is_error = node.source_file.edition() >= Some(SlintEdition::V1_20);
-    match node.child_text(SyntaxKind::Identifier).as_deref() {
+    let keyword = match node.kind() {
+        SyntaxKind::StructDeclaration => Some("struct".into()),
+        _ => node.child_text(SyntaxKind::Identifier),
+    };
+    match keyword.as_deref() {
+        Some("struct") if is_error => diag.push_error(
+            "':=' to declare a struct isn't supported from edition 1.20. Remove the ':='".into(),
+            &colon_equal,
+        ),
+        Some("struct") => diag.push_warning(
+            "':=' to declare a struct is deprecated. Remove the ':='".into(),
+            &colon_equal,
+        ),
         Some("global") if is_error => diag.push_error(
             "':=' to declare a global isn't supported from edition 1.20. Remove the ':=', then review the behavior changes of 1.20 on the 'Editions' page of the documentation".into(),
             &colon_equal,
@@ -649,6 +661,7 @@ fn check_legacy_declaration(node: &syntax_nodes::Component, diag: &mut BuildDiag
         Some("interface") => {}
         _ if is_error => {
             // Without a base, the parser reports an error already
+            let node = syntax_nodes::Component::from(node.clone());
             let Some(base) = node
                 .Element()
                 .QualifiedName()
@@ -677,8 +690,8 @@ pub fn check_legacy_declarations(doc: &syntax_nodes::Document, diag: &mut BuildD
     let exported =
         doc.children().filter(|n| n.kind() == SyntaxKind::ExportsList).flat_map(|n| n.children());
     for n in doc.children().chain(exported) {
-        if n.kind() == SyntaxKind::Component {
-            check_legacy_declaration(&n.into(), diag);
+        if matches!(n.kind(), SyntaxKind::Component | SyntaxKind::StructDeclaration) {
+            check_legacy_declaration(&n, diag);
         }
     }
 }
