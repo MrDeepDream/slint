@@ -632,26 +632,47 @@ pub struct Component {
     pub from_library: Cell<bool>,
 }
 
-/// Reports a global declared with ':=', which is an error from edition 1.20.
+/// Reports a component or global declared with ':=', which is an error from edition 1.20.
 fn check_legacy_declaration(node: &syntax_nodes::Component, diag: &mut BuildDiagnostics) {
     let Some(colon_equal) = node.child_token(SyntaxKind::ColonEqual) else { return };
-    if node.child_text(SyntaxKind::Identifier).is_none_or(|t| t != "global") {
-        return;
-    }
-    if node.source_file.edition() >= Some(SlintEdition::V1_20) {
-        diag.push_error(
+    let is_error = node.source_file.edition() >= Some(SlintEdition::V1_20);
+    match node.child_text(SyntaxKind::Identifier).as_deref() {
+        Some("global") if is_error => diag.push_error(
             "':=' to declare a global isn't supported from edition 1.20. Remove the ':=', then review the behavior changes of 1.20 on the 'Editions' page of the documentation".into(),
             &colon_equal,
-        );
-    } else {
-        diag.push_warning(
+        ),
+        Some("global") => diag.push_warning(
             "':=' to declare a global is deprecated. Remove the ':='".into(),
             &colon_equal,
-        );
+        ),
+        // The parser reports it
+        Some("interface") => {}
+        _ if is_error => {
+            // Without a base, the parser reports an error already
+            let Some(base) = node
+                .Element()
+                .QualifiedName()
+                .filter(|base| base.child_token(SyntaxKind::Identifier).is_some())
+            else {
+                return;
+            };
+            let id = parser::identifier_text(&node.DeclaredIdentifier()).unwrap_or_default();
+            let base = QualifiedTypeName::from_node(base);
+            diag.push_error(
+                format!(
+                    "':=' to declare a component isn't supported from edition 1.20. Use 'component {id} inherits {base} {{', then review the behavior changes of 1.20 on the 'Editions' page of the documentation"
+                ),
+                &colon_equal,
+            )
+        }
+        _ => diag.push_warning(
+            "':=' to declare a component is deprecated. The new syntax declare components with 'component MyComponent {'. Read the documentation for more info".into(),
+            &colon_equal,
+        ),
     }
 }
 
-/// Reports the globals of `doc` declared with ':=', which is an error from edition 1.20.
+/// Reports the declarations of `doc` that use ':=', which is an error from edition 1.20.
 pub fn check_legacy_declarations(doc: &syntax_nodes::Document, diag: &mut BuildDiagnostics) {
     let exported =
         doc.children().filter(|n| n.kind() == SyntaxKind::ExportsList).flat_map(|n| n.children());
