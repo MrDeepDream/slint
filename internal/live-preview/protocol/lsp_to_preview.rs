@@ -20,6 +20,9 @@ pub struct PreviewConfig {
     pub hide_ui: Option<bool>,
     #[serde(default, with = "named_overrides")]
     pub overrides: i_slint_compiler::project_file::Overrides,
+    /// The edition of a file without a project file or `slint!` macro that sets one.
+    #[serde(default)]
+    pub default_edition: Option<i_slint_compiler::project_file::SlintEdition>,
     #[serde(default)]
     pub rust_macro_editions:
         std::collections::BTreeMap<Url, i_slint_compiler::project_file::SlintEdition>,
