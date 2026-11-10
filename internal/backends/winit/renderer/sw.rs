@@ -149,7 +149,8 @@ impl super::WinitCompatibleRenderer for WinitSoftwareRenderer {
             })
         };
 
-        let damage = region
+        #[allow(unused_mut)]
+        let mut damage = region
             .iter()
             .filter_map(|(pos, size)| {
                 Some(softbuffer::Rect {
@@ -160,6 +161,13 @@ impl super::WinitCompatibleRenderer for WinitSoftwareRenderer {
                 })
             })
             .collect::<Vec<_>>();
+        // Windows can discard window contents on its own, for example the part that was outside
+        // every monitor when a frame was presented.
+        // It then asks for a repaint of that update region, and winit validates the region only
+        // after `RedrawRequested`.
+        // The buffer still holds the whole frame, so present that region along with the damage.
+        #[cfg(target_os = "windows")]
+        damage.extend(win32_update_rect(&winit_window, width, height));
         if !damage.is_empty() {
             winit_window.pre_present_notify();
             target_buffer
@@ -210,5 +218,87 @@ impl super::WinitCompatibleRenderer for WinitSoftwareRenderer {
         drop(self.surface.borrow_mut().take());
         drop(self._context.borrow_mut().take());
         Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn win32_update_rect(
+    winit_window: &winit::window::Window,
+    width: NonZeroU32,
+    height: NonZeroU32,
+) -> Option<softbuffer::Rect> {
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::Graphics::Gdi::GetUpdateRect;
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let RawWindowHandle::Win32(handle) = winit_window.window_handle().ok()?.as_raw() else {
+        return None;
+    };
+    let hwnd = HWND(handle.hwnd.get() as *mut core::ffi::c_void);
+    let mut rect = RECT::default();
+    // SAFETY: `winit_window` keeps the window behind `hwnd` alive, and `rect` outlives the call.
+    if !unsafe { GetUpdateRect(hwnd, Some(&mut rect), false) }.as_bool() {
+        return None;
+    }
+    clip_to_buffer(rect.left, rect.top, rect.right, rect.bottom, width, height)
+}
+
+#[cfg(target_os = "windows")]
+fn clip_to_buffer(
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    width: NonZeroU32,
+    height: NonZeroU32,
+) -> Option<softbuffer::Rect> {
+    let clip = |edge: i32, size: NonZeroU32| u32::try_from(edge).unwrap_or(0).min(size.get());
+    let (x, y) = (clip(left, width), clip(top, height));
+    Some(softbuffer::Rect {
+        x,
+        y,
+        width: NonZeroU32::new(clip(right, width).checked_sub(x)?)?,
+        height: NonZeroU32::new(clip(bottom, height).checked_sub(y)?)?,
+    })
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::clip_to_buffer;
+    use core::num::NonZeroU32;
+
+    fn clip(left: i32, top: i32, right: i32, bottom: i32) -> Option<(u32, u32, u32, u32)> {
+        let (width, height) = (NonZeroU32::new(800).unwrap(), NonZeroU32::new(600).unwrap());
+        clip_to_buffer(left, top, right, bottom, width, height)
+            .map(|rect| (rect.x, rect.y, rect.width.get(), rect.height.get()))
+    }
+
+    #[test]
+    fn keeps_rect_inside_buffer() {
+        assert_eq!(clip(10, 20, 110, 70), Some((10, 20, 100, 50)));
+        assert_eq!(clip(0, 0, 800, 600), Some((0, 0, 800, 600)));
+    }
+
+    #[test]
+    fn clips_rect_partly_outside_buffer() {
+        assert_eq!(clip(-50, -400, 300, 200), Some((0, 0, 300, 200)));
+        assert_eq!(clip(700, 500, 1000, 900), Some((700, 500, 100, 100)));
+        assert_eq!(clip(i32::MIN, i32::MIN, i32::MAX, i32::MAX), Some((0, 0, 800, 600)));
+    }
+
+    #[test]
+    fn drops_empty_rect() {
+        assert_eq!(clip(0, 0, 0, 0), None);
+        assert_eq!(clip(10, 20, 10, 70), None);
+        assert_eq!(clip(10, 20, 110, 20), None);
+        assert_eq!(clip(110, 70, 10, 20), None);
+    }
+
+    #[test]
+    fn drops_rect_outside_buffer() {
+        assert_eq!(clip(-300, 10, -100, 50), None);
+        assert_eq!(clip(800, 10, 900, 50), None);
+        assert_eq!(clip(10, -500, 110, 0), None);
+        assert_eq!(clip(10, 600, 110, 700), None);
     }
 }
