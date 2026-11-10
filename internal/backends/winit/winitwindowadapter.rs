@@ -1549,8 +1549,16 @@ impl WinitWindowAdapter {
                     )?;
                     if let Some(physical) = self.physical_size_before_scale_factor.take() {
                         inner_size_writer.request_inner_size(physical).ok();
+                    } else {
+                        // winit sends `Resized` only when the physical size changes. A maximized
+                        // window that moves to a monitor with another scale factor already has
+                        // its final size, so without this the window item keeps the logical size
+                        // of the old scale factor: the renderer draws a frame bigger or smaller
+                        // than the surface, and `update_window_properties` resizes the window to
+                        // that stale size. For other windows, winit applies its own size right
+                        // after this event and sends `Resized`.
+                        self.resize_event(winit_window.surface_size())?;
                     }
-                    // TODO: otherwise send a resize event or try to keep the logical size the same.
                 }
             }
             WinitWindowEvent::ThemeChanged(theme) => {
