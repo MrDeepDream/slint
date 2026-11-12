@@ -3,7 +3,7 @@
 
 // cSpell: ignore bidi
 
-use super::shaping::paragraph_ranges;
+use super::shaping::{PlainTextSource, paragraph_ranges};
 use super::*;
 
 fn paragraphs(text: &str) -> Vec<&str> {
@@ -44,8 +44,85 @@ fn layout_text_with_builder(
         &mut font_ctx,
         PlainOrStyledText::Plain(text.into()),
         Color::default(),
+        None,
     );
     layout(&builder, &mut font_ctx, paragraphs, ScaleFactor::new(1.0), options, None)
+}
+
+/// Everything a layout places, as text: each paragraph's range and position, each line's text
+/// range and metrics, and each glyph with its position.
+fn describe(layout: &Layout) -> std::string::String {
+    use core::fmt::Write;
+    let mut out = std::string::String::new();
+    for paragraph in &layout.paragraphs {
+        writeln!(out, "paragraph {:?} at {}", paragraph.range, paragraph.y.get()).unwrap();
+        for line in paragraph.layout.lines() {
+            writeln!(out, "  line {:?} {:?}", line.text_range(), line.metrics()).unwrap();
+            for item in line.items() {
+                if let parley::layout::PositionedLayoutItem::GlyphRun(run) = item {
+                    for glyph in run.positioned_glyphs() {
+                        writeln!(out, "    {glyph:?}").unwrap();
+                    }
+                }
+            }
+        }
+    }
+    writeln!(out, "{} x {}", layout.max_width.get(), layout.height.get()).unwrap();
+    out
+}
+
+#[test]
+fn reshaping_keeps_unchanged_leading_paragraphs() {
+    let wrap = super::shaping::wrap_builder_for_tests();
+    let larger = LayoutWithoutLineBreaksBuilder::new(
+        Some(FontRequest { pixel_size: Some(LogicalLength::new(20.)), ..Default::default() }),
+        TextWrap::WordWrap,
+        None,
+        ScaleFactor::new(1.0),
+    );
+    let long = "A\nBC\nD\nWhen the amount of lines - due to wrapping and number of paragraphs";
+    let longer =
+        "A\nBC\nD\nWhen the amount of lines - due to wrapping and number of paragraphs grows";
+
+    let mut font_ctx = test_font_context();
+    let mut previous: Option<(Vec<_>, PlainTextSource)> = None;
+    // A waiting text, the reply's first piece replacing it, the reply growing, then a narrower
+    // box, which breaks the kept paragraphs again, and a larger font, which shapes all of them.
+    for (text, builder, width, expected_kept) in [
+        ("Working…", &wrap, 200., 0),
+        ("A\nB", &wrap, 200., 0),
+        ("A\nBC\nD", &wrap, 200., 1),
+        (long, &wrap, 200., 3),
+        (longer, &wrap, 200., 3),
+        (longer, &wrap, 120., 4),
+        (longer, &larger, 120., 0),
+    ] {
+        let options = || LayoutOptions {
+            max_width: Some(LogicalLength::new(width)),
+            ..LayoutOptions::default()
+        };
+        let paragraphs = create_text_paragraphs(
+            builder,
+            &mut font_ctx,
+            PlainOrStyledText::Plain(text.into()),
+            Color::default(),
+            previous.take(),
+        );
+
+        // A shaped paragraph has no lines yet, so the ones with lines are the kept ones.
+        let kept = paragraphs.iter().take_while(|p| p.broken_for.is_some()).count();
+        assert_eq!(kept, expected_kept, "paragraphs kept for {text:?}");
+        assert!(paragraphs[kept..].iter().all(|p| p.broken_for.is_none()), "{text:?}");
+
+        let reshaped =
+            layout(builder, &mut font_ctx, paragraphs, ScaleFactor::new(1.0), options(), None);
+        let fresh = layout_text_with_builder(text, builder.clone(), options());
+        assert_eq!(describe(&reshaped), describe(&fresh), "layout of {text:?} at {width}");
+
+        let (paragraphs, _) = reshaped.dismantle();
+        previous =
+            Some((paragraphs, PlainTextSource { text: text.into(), builder: builder.clone() }));
+    }
 }
 
 fn layout_text(text: &str) -> Layout {

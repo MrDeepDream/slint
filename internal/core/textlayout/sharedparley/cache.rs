@@ -11,7 +11,7 @@
 //! with the one shaping function every path must share.
 
 use super::layout::RetainedLineBreaking;
-use super::shaping::TextParagraph;
+use super::shaping::{PlainTextSource, TextParagraph};
 use super::*;
 
 /// Shaped paragraphs together with the wrap mode they were shaped with.
@@ -32,7 +32,13 @@ struct CachedParagraphs {
     /// `None` while a [`CachedParagraphsGuard`] has the paragraphs checked out; the guard puts
     /// them back when it drops. Finding `None` here therefore means the previous caller returned
     /// without handing them back, and the entry has to be reshaped rather than served empty.
-    paragraphs: Option<Vec<TextParagraph>>,
+    ///
+    /// A `Cell`, so that [`cached_paragraphs`] can check them out through
+    /// [`ItemCache::with_entry`](crate::item_rendering::ItemCache::with_entry), before the entry is
+    /// replaced when its text changed: the reshape keeps the unchanged paragraphs.
+    paragraphs: std::cell::Cell<Option<Vec<TextParagraph>>>,
+    /// What `paragraphs` were shaped from, when that was plain text.
+    plain_source: Option<PlainTextSource>,
     /// The [`TextLayoutCache::generation`] at which this entry was last served.
     last_used: u32,
 }
@@ -199,7 +205,7 @@ impl Drop for CachedParagraphsGuard<'_> {
     fn drop(&mut self) {
         if let Some(container) = &mut self.container {
             if let Some(paragraphs) = self.paragraphs.take() {
-                container.paragraphs = Some(paragraphs);
+                container.paragraphs.set(Some(paragraphs));
             }
             if let Some(line_breaking) = self.line_breaking.take() {
                 container.line_breaking = Some(line_breaking);
@@ -210,7 +216,9 @@ impl Drop for CachedParagraphsGuard<'_> {
 
 /// Shapes the text of `item_rc` for `wrap`, reusing the `TextLayoutCache` entry when it holds
 /// paragraphs shaped for the same wrap mode and none of the properties `shape` read have changed
-/// since. Without a cache or item it just shapes, so the caller doesn't need to special-case that.
+/// since. When some have, `shape` gets the entry's paragraphs and their source, to keep the
+/// unchanged ones. Without a cache or item it just shapes, so the caller doesn't need to
+/// special-case that.
 ///
 /// `shape` runs inside the entry's dependency tracker, so everything it reads (the text and the
 /// font request, at least) invalidates the entry when it changes. Properties evaluated by the
@@ -221,11 +229,14 @@ pub(super) fn cached_paragraphs<'a>(
     wrap: TextWrap,
     window: &crate::api::Window,
     font_context: &mut parley::FontContext,
-    shape: &dyn Fn(&mut parley::FontContext) -> Vec<TextParagraph>,
+    shape: &dyn Fn(
+        &mut parley::FontContext,
+        Option<(Vec<TextParagraph>, PlainTextSource)>,
+    ) -> (Vec<TextParagraph>, Option<PlainTextSource>),
 ) -> CachedParagraphsGuard<'a> {
     let Some((cache, item_rc)) = cache.zip(item_rc) else {
         return CachedParagraphsGuard {
-            paragraphs: Some(shape(font_context)),
+            paragraphs: Some(shape(font_context, None).0),
             line_breaking: None,
             container: None,
         };
@@ -233,20 +244,29 @@ pub(super) fn cached_paragraphs<'a>(
 
     cache.clear_if_scale_factor_changed(window);
 
+    // Check the paragraphs out before the entry is checked for changes: a reshape replaces the
+    // entry, and can only keep the unchanged paragraphs it is handed.
+    //
     // Shaped geometry must never be mixed across wrap modes, and the entry only holds one mode
     // at a time. Drop a mismatching one up front so the shaping below happens in the regular
     // (vacant) path, inside a fresh dependency tracker and without the cache borrowed.
-    //
     // Paragraphs that were never handed back can't be served either.
-    let stale = cache
-        .inner
-        .with_entry(item_rc, |entry| {
-            (entry.wrap != wrap || entry.paragraphs.is_none()).then_some(())
-        })
-        .is_some();
-    if stale {
-        cache.inner.release(item_rc);
-    }
+    let checked_out = cache.inner.with_entry(item_rc, |entry| {
+        Some(
+            entry
+                .paragraphs
+                .take()
+                .filter(|_| entry.wrap == wrap)
+                .map(|paragraphs| (paragraphs, entry.plain_source.clone())),
+        )
+    });
+    let mut checked_out = match checked_out {
+        Some(None) => {
+            cache.inner.release(item_rc);
+            None
+        }
+        checked_out => checked_out.flatten(),
+    };
 
     // Sweep before this item's entry is checked out and blocks `retain`'s access.
     if cache.entry_count_estimate.get() > cache.sweep_threshold.get() {
@@ -257,15 +277,24 @@ pub(super) fn cached_paragraphs<'a>(
         #[cfg(feature = "testing")]
         cache.cache_miss_count.set(cache.cache_miss_count.get() + 1);
         cache.entry_count_estimate.set(cache.entry_count_estimate.get() + 1);
+        let previous = checked_out
+            .take()
+            .and_then(|(paragraphs, source)| source.map(|source| (paragraphs, source)));
+        let (paragraphs, plain_source) = shape(font_context, previous);
         CachedParagraphs {
             wrap,
-            paragraphs: Some(shape(font_context)),
+            paragraphs: std::cell::Cell::new(Some(paragraphs)),
+            plain_source,
             line_breaking: None,
             last_used: 0, // stamped right below, for both a hit and this miss
         }
     });
     entry.last_used = cache.generation.get();
-    let paragraphs = entry.paragraphs.take().unwrap_or_default();
+    // A hit leaves the paragraphs checked out above; a reshape put new ones into the entry.
+    let paragraphs = match checked_out {
+        Some((paragraphs, _)) => paragraphs,
+        None => entry.paragraphs.take().unwrap_or_default(),
+    };
     CachedParagraphsGuard {
         paragraphs: Some(paragraphs),
         line_breaking: None,

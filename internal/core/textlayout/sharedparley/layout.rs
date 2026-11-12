@@ -147,7 +147,8 @@ pub(super) fn layout(
 
     // Returned None if failed to get the ellipsis glyph for some rare reason.
     let get_ellipsis_glyph = |font_context: &mut parley::FontContext| {
-        let mut layout = layout_builder.build(font_context, "…", None, None);
+        let line_height_ratio = layout_builder.line_height_ratio(font_context);
+        let mut layout = layout_builder.build(font_context, "…", None, None, line_height_ratio);
         layout.break_all_lines(None);
         let line = layout.lines().next()?;
         let item = line.items().next()?;
@@ -169,10 +170,17 @@ pub(super) fn layout(
         None
     };
 
+    // A paragraph kept from before a text change still holds its lines, so only the paragraphs
+    // shaped since, or broken for another width or alignment, are broken again. The positions and
+    // the metrics below are derived from all of them.
+    let broken_for = Some((max_physical_width, inputs.alignment));
     let mut para_y = 0.0;
     for para in paragraphs.iter_mut() {
-        para.layout.break_all_lines(max_physical_width.map(|width| width.get()));
-        para.layout.align(inputs.alignment, parley::AlignmentOptions::default());
+        if para.broken_for != broken_for {
+            para.layout.break_all_lines(max_physical_width.map(|width| width.get()));
+            para.layout.align(inputs.alignment, parley::AlignmentOptions::default());
+            para.broken_for = broken_for;
+        }
 
         para.y = PhysicalLength::new(para_y);
         para_y += para.layout.height();

@@ -10,6 +10,7 @@
 //! dependencies, so neither may shape through anything narrower.
 
 use super::*;
+use crate::SharedString;
 
 /// Font size of inline `code` runs, as a fraction of the surrounding body
 /// text. Matches the convention used by GitHub-style markdown renderers — the
@@ -29,6 +30,7 @@ pub(super) struct Brush {
     pub(super) link_color: Option<Color>,
 }
 
+#[derive(Clone, PartialEq)]
 pub(super) struct LayoutWithoutLineBreaksBuilder {
     font_request: Option<FontRequest>,
     pub(super) text_wrap: TextWrap,
@@ -62,20 +64,24 @@ impl LayoutWithoutLineBreaksBuilder {
         }
     }
 
+    /// The line-height ratio every run built with this builder gets: the requested font's natural
+    /// one, so fallback fonts, such as the symbol font used for password characters, don't
+    /// enlarge the line box. It takes a font lookup and depends only on the font request, so a
+    /// shaping pass computes it once and passes it to [`Self::build`] for each paragraph.
+    pub(super) fn line_height_ratio(&self, font_ctx: &mut parley::FontContext) -> Option<f32> {
+        self.font_request.as_ref().and_then(|fr| line_height_ratio(font_ctx, fr))
+    }
+
     fn ranged_builder<'a>(
         &self,
         layout_ctx: &'a mut parley::LayoutContext<Brush>,
         font_ctx: &'a mut parley::FontContext,
         text: &'a str,
+        line_height_ratio: Option<f32>,
     ) -> parley::RangedBuilder<'a, Brush> {
-        // Use the requested font's natural line-height ratio for every run so fallback fonts,
-        // such as the symbol font used for password characters, don't enlarge the line box.
-        // `FontSizeRelative` scales the result with each styled span's font size.
-        let line_height_ratio =
-            self.font_request.as_ref().and_then(|fr| line_height_ratio(font_ctx, fr));
-
         let mut builder = layout_ctx.ranged_builder(font_ctx, text, self.scale_factor.get(), false);
 
+        // `FontSizeRelative` scales the ratio with each styled span's font size.
         if let Some(ratio) = line_height_ratio {
             builder.push_default(parley::StyleProperty::LineHeight(
                 parley::style::LineHeight::FontSizeRelative(ratio),
@@ -165,11 +171,13 @@ impl LayoutWithoutLineBreaksBuilder {
         text: &str,
         formatting: impl IntoIterator<Item = i_slint_common::styled_text::FormattedSpan>,
         link_color: Option<Color>,
+        line_height_ratio: Option<f32>,
     ) -> parley::Layout<Brush> {
         use i_slint_common::styled_text::Style;
 
         LAYOUT_CONTEXT.with_borrow_mut(|layout_ctx| {
-            let mut builder = self.ranged_builder(layout_ctx, font_context, text);
+            let mut builder =
+                self.ranged_builder(layout_ctx, font_context, text, line_height_ratio);
 
             // filter empty ranges otherwise parley will panic on assert
             for span in formatting.into_iter().filter(|s| !s.range.is_empty()) {
@@ -270,12 +278,30 @@ pub(super) fn paragraph_ranges(text: &str) -> impl Iterator<Item = Range<usize>>
     })
 }
 
+/// What the paragraphs of a cache entry were shaped from, when that was plain text, so that the
+/// next shaping of the entry can keep those whose text is unchanged. The link color is left out:
+/// plain text has no links, so it never reaches the paragraphs.
+#[derive(Clone)]
+pub(super) struct PlainTextSource {
+    pub(super) text: SharedString,
+    pub(super) builder: LayoutWithoutLineBreaksBuilder,
+}
+
+/// Shapes `text` into its paragraphs.
+///
+/// `previous` holds paragraphs shaped before from plain text, with their source. When that source
+/// was shaped with the same builder, the leading paragraphs whose text and position are unchanged
+/// are kept, together with the lines they are broken into, and shaping starts at the first changed
+/// one: a text that grows at its end, like a streamed reply, then only shapes its last paragraphs
+/// again. Each paragraph is shaped on its own, so the result equals shaping all of `text`.
 pub(super) fn create_text_paragraphs(
     layout_builder: &LayoutWithoutLineBreaksBuilder,
     font_context: &mut parley::FontContext,
     text: PlainOrStyledText,
     link_color: Color,
+    previous: Option<(Vec<TextParagraph>, PlainTextSource)>,
 ) -> Vec<TextParagraph> {
+    let line_height_ratio = layout_builder.line_height_ratio(font_context);
     let paragraph_from_text =
         |font_context: &mut parley::FontContext,
          text: &str,
@@ -288,16 +314,46 @@ pub(super) fn create_text_paragraphs(
                 .map(|s| s.range.clone())
                 .collect();
 
-            let layout = layout_builder.build(font_context, text, formatting, Some(link_color));
+            let layout = layout_builder.build(
+                font_context,
+                text,
+                formatting,
+                Some(link_color),
+                line_height_ratio,
+            );
 
-            TextParagraph { range, y: PhysicalLength::default(), layout, links, code_ranges }
+            TextParagraph {
+                range,
+                y: PhysicalLength::default(),
+                layout,
+                links,
+                code_ranges,
+                broken_for: None,
+            }
         };
 
     let mut paragraphs = Vec::with_capacity(1);
 
     match text {
         PlainOrStyledText::Plain(ref text) => {
-            for range in paragraph_ranges(text) {
+            let mut ranges = paragraph_ranges(text).peekable();
+            if let Some((mut kept, source)) =
+                previous.filter(|(_, source)| source.builder == *layout_builder)
+            {
+                let unchanged = |paragraph: &TextParagraph, range: &Range<usize>| {
+                    paragraph.range == *range
+                        && source.text.get(range.clone()) == Some(&text[range.clone()])
+                };
+                let kept_count = kept
+                    .iter()
+                    .take_while(|paragraph| {
+                        ranges.next_if(|range| unchanged(paragraph, range)).is_some()
+                    })
+                    .count();
+                kept.truncate(kept_count);
+                paragraphs = kept;
+            }
+            for range in ranges {
                 paragraphs.push(paragraph_from_text(
                     font_context,
                     &text[range.clone()],
@@ -378,15 +434,26 @@ pub(super) fn wrap_builder_for_tests() -> LayoutWithoutLineBreaksBuilder {
 /// Shapes `text` the way both the drawing and the measuring paths need it, so that they can share
 /// one cache entry. `text_wrap` is passed separately because `text_size` measures the unwrapped
 /// width of items that are otherwise wrapped.
+///
+/// `previous` is what the entry held before, which [`create_text_paragraphs`] keeps the unchanged
+/// paragraphs of. Returns the paragraphs with their source, for the next shaping of the entry.
 pub(super) fn shape_paragraphs(
     text: Pin<&dyn crate::item_rendering::RenderString>,
     item_rc: Option<&crate::item_tree::ItemRc>,
     text_wrap: TextWrap,
     scale_factor: ScaleFactor,
     font_context: &mut parley::FontContext,
-) -> Vec<TextParagraph> {
+    previous: Option<(Vec<TextParagraph>, PlainTextSource)>,
+) -> (Vec<TextParagraph>, Option<PlainTextSource>) {
     let builder = shaping_builder(text, item_rc, text_wrap, scale_factor);
-    create_text_paragraphs(&builder, font_context, text.text(), text.link_color())
+    let content = text.text();
+    let source_text = match &content {
+        PlainOrStyledText::Plain(text) => Some(text.clone()),
+        PlainOrStyledText::Styled(_) => None,
+    };
+    let paragraphs =
+        create_text_paragraphs(&builder, font_context, content, text.link_color(), previous);
+    (paragraphs, source_text.map(|text| PlainTextSource { text, builder }))
 }
 
 pub(super) struct TextParagraph {
@@ -398,4 +465,8 @@ pub(super) struct TextParagraph {
     /// translucent rounded background by `draw` for visual parity with common markdown
     /// renderers.
     pub(super) code_ranges: std::vec::Vec<Range<usize>>,
+    /// The maximum width and alignment the lines of `layout` are broken and aligned for, so that
+    /// [`super::layout::layout`] skips a paragraph kept from before a text change. `None` until
+    /// the first breaking.
+    pub(super) broken_for: Option<(Option<PhysicalLength>, parley::Alignment)>,
 }
