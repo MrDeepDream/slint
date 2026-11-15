@@ -335,9 +335,13 @@ pub fn parse_interpolated<S: AsRef<[StyledTextParagraph]>>(
     let mut interleaved_count: usize = 0;
 
     let mut current_paragraph: Option<StyledTextParagraph> = None;
+    // True for the event right after the start of a list item, while the current
+    // paragraph holds only the item's marker.
+    let mut item_just_started = false;
 
     for (event, event_range) in parser.into_offset_iter() {
         let indentation = list_state_stack.len().saturating_sub(1) as _;
+        let after_item_start = core::mem::take(&mut item_just_started);
 
         match event {
             pulldown_cmark::Event::SoftBreak | pulldown_cmark::Event::HardBreak => {
@@ -358,6 +362,11 @@ pub fn parse_interpolated<S: AsRef<[StyledTextParagraph]>>(
             pulldown_cmark::Event::Start(tag) => {
                 let style = match tag {
                     pulldown_cmark::Tag::Paragraph => {
+                        // In a loose list, the first paragraph of an item holds the
+                        // item's text. It continues the line of the item's marker.
+                        if after_item_start {
+                            continue;
+                        }
                         if let Some(paragraph) =
                             current_paragraph.replace(begin_paragraph(indentation, None))
                         {
@@ -379,6 +388,7 @@ pub fn parse_interpolated<S: AsRef<[StyledTextParagraph]>>(
                         if let Some(paragraph) = old_paragraph {
                             paragraphs.push(paragraph);
                         }
+                        item_just_started = true;
                         continue;
                     }
                     pulldown_cmark::Tag::List(index) => {
@@ -1004,5 +1014,74 @@ fn markdown_interleaved_html_and_emphasis() {
     assert!(
         errors.iter().any(|e| e.to_string().contains("Closing html tag")),
         "Expected ClosingTagMismatch, got: {errors:?}"
+    );
+}
+
+#[cfg(feature = "markdown")]
+#[test]
+fn markdown_loose_lists() {
+    // Blank lines between the items make a loose list, where the text of each item
+    // is in a paragraph. That text stays on the line of the item's marker.
+    assert_eq!(
+        assert_no_errors(parse_interpolated::<&[_]>(
+            "
+- line 1
+
+- line 2
+",
+            &[]
+        )),
+        [
+            paragraph_from_plain_text("• line 1".into()),
+            paragraph_from_plain_text("• line 2".into()),
+        ]
+    );
+
+    assert_eq!(
+        assert_no_errors(parse_interpolated::<&[_]>(
+            "
+1. **a**
+
+2. b
+
+4. c
+",
+            &[]
+        )),
+        [
+            StyledTextParagraph {
+                text: "1. a".into(),
+                formatting: alloc::vec![FormattedSpan { range: 3..4, style: Style::Strong }],
+                links: alloc::vec::Vec::new()
+            },
+            paragraph_from_plain_text("2. b".into()),
+            paragraph_from_plain_text("3. c".into()),
+        ]
+    );
+
+    // Only the first paragraph of an item continues the marker's line.
+    assert_eq!(
+        assert_no_errors(parse_interpolated::<&[_]>(
+            "
+- line 1
+
+  more
+",
+            &[]
+        )),
+        [paragraph_from_plain_text("• line 1".into()), paragraph_from_plain_text("more".into())]
+    );
+
+    // A paragraph after an empty item is not part of that item.
+    assert_eq!(
+        assert_no_errors(parse_interpolated::<&[_]>(
+            "
+-
+
+after
+",
+            &[]
+        )),
+        [paragraph_from_plain_text("• ".into()), paragraph_from_plain_text("after".into())]
     );
 }
