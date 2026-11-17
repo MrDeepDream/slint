@@ -235,6 +235,11 @@ pub use i_slint_core::model::{
 pub use i_slint_core::styled_text::StyledText;
 #[cfg(feature = "std")]
 pub use i_slint_core::styled_text::StyledTextFromMarkdownError;
+
+/// The parts that [`StyledText::from_paragraphs`] builds a [`StyledText`] from.
+pub mod styled_text {
+    pub use i_slint_core::styled_text::{FormattedSpan, Style, StyledTextParagraph};
+}
 pub use i_slint_core::timers::{Timer, TimerMode};
 pub use i_slint_core::translations::{SelectBundledTranslationError, select_bundled_translation};
 

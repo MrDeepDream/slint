@@ -506,6 +506,30 @@ pub trait RenderText: RenderString {
     fn wrap(self: Pin<&Self>) -> TextWrap;
     fn overflow(self: Pin<&Self>) -> TextOverflow;
     fn is_markdown(self: Pin<&Self>) -> bool;
+    /// What the user's interaction with the text adds to its drawing. Only `StyledText` has any.
+    fn interaction(self: Pin<&Self>) -> Option<TextInteraction> {
+        None
+    }
+}
+
+/// The selection, the hovered link and the focused link that `draw_text` paints over a text's
+/// glyphs. They only change colors, so none of them reaches the shaping or the line breaking.
+#[derive(Clone, Debug, Default)]
+pub struct TextInteraction {
+    /// Byte range in the plain text, already clamped to it and to character boundaries.
+    pub selection: core::ops::Range<usize>,
+    /// The color selected glyphs are drawn in. Transparent keeps their own color.
+    pub selection_foreground: Color,
+    /// The color behind selected glyphs. Transparent draws no selection.
+    pub selection_background: Color,
+    /// Index of the link under the pointer, in the order of the text.
+    pub hovered_link: Option<usize>,
+    /// The color of the rounded box behind the hovered link.
+    pub link_hover_background: Color,
+    /// Index of the link that has the keyboard focus.
+    pub focused_link: Option<usize>,
+    /// The color of the ring around the focused link.
+    pub link_focus_color: Color,
 }
 
 impl HasFont for (SharedString, Brush) {

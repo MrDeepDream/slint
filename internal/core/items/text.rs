@@ -249,11 +249,49 @@ pub struct StyledTextItem {
     pub max_lines: Property<i32>,
     pub link_clicked: Callback<StringArg>,
     pub link_color: Property<Color>,
+    pub selection_start: Property<i32>,
+    pub selection_end: Property<i32>,
+    pub selection_foreground_color: Property<Color>,
+    pub selection_background_color: Property<Color>,
+    pub link_hover_color: Property<Color>,
+    pub link_focus_color: Property<Color>,
+    pub copy_requested: Callback<StringArg>,
     pub cached_rendering_data: CachedRenderingData,
+    /// One more than the index of the link under the pointer, 0 for none.
+    hovered_link: Property<usize>,
+    /// One more than the index of the link that has the keyboard focus, 0 for none.
+    focused_link: Property<usize>,
+    has_focus: Property<bool>,
+    /// Whether the left button went down on the text and is still down.
+    pressed: Cell<bool>,
+    /// What the press selected, which a drag extends: the pressed offset, or the word or
+    /// paragraph a double or triple press selected.
+    press_start: Cell<usize>,
+    press_end: Cell<usize>,
+    /// Clamps the selection when the text changes.
+    selection_clamp: crate::properties::ChangeTracker,
 }
 
 impl Item for StyledTextItem {
-    fn init(self: Pin<&Self>, _self_rc: &ItemRc) {}
+    fn init(self: Pin<&Self>, self_rc: &ItemRc) {
+        // The selection survives a text change, clamped to the new text, so that a text that
+        // grows while it streams in keeps what the user selected in it.
+        self.selection_clamp.init_delayed(
+            self_rc.downgrade(),
+            |self_weak| {
+                self_weak
+                    .upgrade()
+                    .and_then(|rc| rc.downcast::<StyledTextItem>())
+                    .map_or(0, |item| item.as_pin_ref().text().clamp_offset(usize::MAX))
+            },
+            |self_weak, _| {
+                if let Some(item) = self_weak.upgrade().and_then(|rc| rc.downcast::<Self>()) {
+                    let item = item.as_pin_ref();
+                    item.set_selection(item.selection());
+                }
+            },
+        );
+    }
 
     fn deinit(self: Pin<&Self>, _window_adapter: &Rc<dyn WindowAdapter>) {}
 
@@ -293,41 +331,84 @@ impl Item for StyledTextItem {
         cursor: &mut super::MouseCursorInner,
     ) -> InputEventResult {
         #[cfg(feature = "shared-parley")]
-        let find_link = |position: &LogicalPoint| {
-            let window_inner = WindowInner::from_pub(window_adapter.window());
-            let scale_factor = crate::lengths::ScaleFactor::new(window_inner.scale_factor());
-            crate::textlayout::sharedparley::link_under_cursor(
-                scale_factor,
+        let hit = |position: &LogicalPoint| {
+            crate::textlayout::sharedparley::styled_text_hit_test(
+                window_adapter.renderer(),
                 self,
                 self_rc,
                 LogicalSize::from_lengths(self.width(), self.height()),
-                *position * scale_factor,
-                window_adapter.window(),
-                None,
+                *position,
             )
+        };
+        // Off a link the cursor is left as it was, which the element has always done.
+        #[cfg(feature = "shared-parley")]
+        let mut set_cursor = |link: Option<usize>| {
+            if link.is_some() {
+                *cursor = super::MouseCursorInner::BuiltIn(super::BuiltInMouseCursor::Pointer);
+            }
         };
         match event {
             #[cfg(feature = "shared-parley")]
-            MouseEvent::Released {
-                position,
-                button: PointerEventButton::Left,
-                click_count: _,
-                touch_finger_id: _,
-            } => {
-                if let Some(link) = find_link(position) {
-                    *cursor = super::MouseCursorInner::BuiltIn(super::BuiltInMouseCursor::Pointer);
-                    Self::FIELD_OFFSETS.link_clicked().apply_pin(self).call(&(link.into(),));
+            MouseEvent::Pressed { position, button: PointerEventButton::Left, click_count, .. } => {
+                self.focused_link.set(0);
+                WindowInner::from_pub(window_adapter.window()).set_focus_item(
+                    self_rc,
+                    true,
+                    FocusReason::PointerClick,
+                );
+                if let Some((offset, link)) = hit(position) {
+                    let text = self.text();
+                    let press = match click_count % 3 {
+                        0 => offset..offset,
+                        1 => word_at(&text, offset),
+                        _ => text.paragraph_at(offset).0,
+                    };
+                    self.pressed.set(true);
+                    self.press_start.set(press.start);
+                    self.press_end.set(press.end);
+                    self.set_selection(press);
+                    set_cursor(link);
                 }
+                InputEventResult::GrabMouse
+            }
+            #[cfg(feature = "shared-parley")]
+            MouseEvent::Moved { position, .. } => {
+                let hit = hit(position);
+                if self.pressed.get() {
+                    if let Some((offset, _)) = hit {
+                        self.set_selection(
+                            self.press_start.get().min(offset)..self.press_end.get().max(offset),
+                        );
+                    }
+                    return InputEventResult::GrabMouse;
+                }
+                let link = hit.and_then(|(_, link)| link);
+                self.hovered_link.set(link.map_or(0, |link| link + 1));
+                set_cursor(link);
                 InputEventResult::EventAccepted
             }
             #[cfg(feature = "shared-parley")]
-            MouseEvent::Moved { position, .. }
-            | MouseEvent::Pressed { position, .. }
-            | MouseEvent::Released { position, .. } => {
-                if find_link(position).is_some() {
-                    *cursor = super::MouseCursorInner::BuiltIn(super::BuiltInMouseCursor::Pointer);
+            MouseEvent::Released { position, button, .. } => {
+                let link = hit(position).and_then(|(_, link)| link);
+                if *button == PointerEventButton::Left {
+                    self.pressed.set(false);
+                    // A press that selected nothing is a click.
+                    if let Some(link) = link.filter(|_| self.selection().is_empty()) {
+                        self.activate_link(link);
+                    }
                 }
+                set_cursor(link);
                 InputEventResult::EventAccepted
+            }
+            #[cfg(feature = "shared-parley")]
+            MouseEvent::Pressed { position, .. } => {
+                set_cursor(hit(position).and_then(|(_, link)| link));
+                InputEventResult::EventAccepted
+            }
+            MouseEvent::Exit => {
+                self.pressed.set(false);
+                self.hovered_link.set(0);
+                InputEventResult::EventIgnored
             }
             _ => InputEventResult::EventIgnored,
         }
@@ -344,20 +425,79 @@ impl Item for StyledTextItem {
 
     fn key_event(
         self: Pin<&Self>,
-        _: &InternalKeyEvent,
+        event: &InternalKeyEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
     ) -> KeyEventResult {
-        KeyEventResult::EventIgnored
+        if event.event_type != KeyEventType::KeyPressed {
+            return KeyEventResult::EventIgnored;
+        }
+        let text = self.text();
+        let key = &event.key_event;
+        let tab = key.text.starts_with(key_codes::Tab);
+        let backtab = key.text.starts_with(key_codes::Backtab) || (tab && key.modifiers.shift);
+        if (tab || backtab) && !(key.modifiers.control || key.modifiers.alt || key.modifiers.meta)
+        {
+            let focused = self.focused_link().checked_sub(1);
+            // Past the first or the last link the key is left to the window, which moves the
+            // focus to the previous or the next element.
+            return match step_link_focus(focused, text.links().count(), backtab) {
+                Some(link) => {
+                    self.focused_link.set(link + 1);
+                    KeyEventResult::EventAccepted
+                }
+                None => KeyEventResult::EventIgnored,
+            };
+        }
+        if let Some(link) = self.focused_link().checked_sub(1)
+            && key.text.starts_with(key_codes::Return)
+        {
+            self.activate_link(link);
+            return KeyEventResult::EventAccepted;
+        }
+        match event.shortcut() {
+            Some(StandardShortcut::SelectAll) => {
+                self.set_selection(0..text.clamp_offset(usize::MAX));
+                KeyEventResult::EventAccepted
+            }
+            Some(StandardShortcut::Copy) if !self.selection().is_empty() => {
+                let copied = text.plain_text(self.selection());
+                Self::FIELD_OFFSETS.copy_requested().apply_pin(self).call(&(copied.into(),));
+                KeyEventResult::EventAccepted
+            }
+            _ => KeyEventResult::EventIgnored,
+        }
     }
 
     fn focus_event(
         self: Pin<&Self>,
-        _: &FocusEvent,
-        _window_adapter: &Rc<dyn WindowAdapter>,
+        event: &FocusEvent,
+        window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
     ) -> FocusEventResult {
-        FocusEventResult::FocusIgnored
+        match event {
+            FocusEvent::FocusIn(reason) => {
+                // Tab only stops at a text with links, on its first link, or on its last one
+                // when going backwards.
+                if *reason == FocusReason::TabNavigation {
+                    let backward =
+                        WindowInner::from_pub(window_adapter.window()).focus_moving_backward.get();
+                    let Some(link) = step_link_focus(None, self.text().links().count(), backward)
+                    else {
+                        return FocusEventResult::FocusIgnored;
+                    };
+                    self.focused_link.set(link + 1);
+                }
+                self.has_focus.set(true);
+            }
+            FocusEvent::FocusOut(reason) => {
+                self.has_focus.set(false);
+                if !matches!(reason, FocusReason::WindowActivation | FocusReason::PopupActivation) {
+                    self.focused_link.set(0);
+                }
+            }
+        }
+        FocusEventResult::FocusAccepted
     }
 
     fn render(
@@ -376,6 +516,12 @@ impl Item for StyledTextItem {
         _self_rc: &ItemRc,
         geometry: LogicalRect,
     ) -> LogicalRect {
+        // The ring around a focused link can reach past the item's edge.
+        #[cfg(feature = "shared-parley")]
+        let geometry = {
+            let ring = crate::textlayout::sharedparley::LINK_FOCUS_RING_WIDTH.get();
+            geometry.inflate(ring, ring)
+        };
         geometry
     }
 
@@ -445,6 +591,18 @@ impl RenderText for StyledTextItem {
     fn is_markdown(self: Pin<&Self>) -> bool {
         true
     }
+
+    fn interaction(self: Pin<&Self>) -> Option<crate::item_rendering::TextInteraction> {
+        Some(crate::item_rendering::TextInteraction {
+            selection: self.selection(),
+            selection_foreground: self.selection_foreground_color(),
+            selection_background: self.selection_background_color(),
+            hovered_link: self.hovered_link().checked_sub(1),
+            link_hover_background: self.link_hover_color(),
+            focused_link: self.focused_link_index(),
+            link_focus_color: self.link_focus_color(),
+        })
+    }
 }
 
 impl StyledTextItem {
@@ -456,6 +614,86 @@ impl StyledTextItem {
         let font_request = self.font_request(self_rc);
         window_adapter.renderer().font_metrics(font_request)
     }
+
+    /// The selection as a byte range in the plain text, clamped to it.
+    pub fn selection(self: Pin<&Self>) -> core::ops::Range<usize> {
+        clamp_selection(&self.text(), self.selection_start(), self.selection_end())
+    }
+
+    fn set_selection(self: Pin<&Self>, selection: core::ops::Range<usize>) {
+        let to_i32 = |offset| i32::try_from(offset).unwrap_or(i32::MAX);
+        let (start, end) = (to_i32(selection.start), to_i32(selection.end));
+        if self.selection_start() != start {
+            self.selection_start.set(start);
+        }
+        if self.selection_end() != end {
+            self.selection_end.set(end);
+        }
+    }
+
+    /// Calls `link-clicked` with the target of the link at `index`, counting links in the order
+    /// of the text.
+    pub fn activate_link(self: Pin<&Self>, index: usize) {
+        let text = self.text();
+        if let Some((_, url)) = text.links().nth(index) {
+            Self::FIELD_OFFSETS.link_clicked().apply_pin(self).call(&(url.into(),));
+        }
+    }
+
+    /// The index of the link that has the keyboard focus, counting links in the order of the
+    /// text.
+    pub fn focused_link_index(self: Pin<&Self>) -> Option<usize> {
+        self.focused_link().checked_sub(1).filter(|_| self.has_focus())
+    }
+
+    /// Gives the keyboard focus to the link at `index`.
+    pub fn focus_link(
+        self: Pin<&Self>,
+        index: usize,
+        window_adapter: &Rc<dyn WindowAdapter>,
+        self_rc: &ItemRc,
+    ) {
+        WindowInner::from_pub(window_adapter.window()).set_focus_item(
+            self_rc,
+            true,
+            FocusReason::Programmatic,
+        );
+        if index < self.text().links().count() {
+            self.focused_link.set(index + 1);
+        }
+    }
+}
+
+/// The selection between the byte offsets `start` and `end`, in either order, clamped to the
+/// plain text of `text` and to its character boundaries.
+fn clamp_selection(
+    text: &crate::styled_text::StyledText,
+    start: i32,
+    end: i32,
+) -> core::ops::Range<usize> {
+    let clamp = |offset: i32| text.clamp_offset(usize::try_from(offset).unwrap_or(0));
+    let (start, end) = (clamp(start), clamp(end));
+    start.min(end)..start.max(end)
+}
+
+/// Where Tab, or Shift+Tab when `backward`, moves the focus among `count` links from `focused`.
+/// `None` past either end, where the focus leaves the text.
+fn step_link_focus(focused: Option<usize>, count: usize, backward: bool) -> Option<usize> {
+    match (focused, backward) {
+        (None, false) => (count > 0).then_some(0),
+        (None, true) => count.checked_sub(1),
+        (Some(link), false) => link.checked_add(1).filter(|next| *next < count),
+        (Some(link), true) => link.min(count).checked_sub(1),
+    }
+}
+
+/// The byte range in the plain text of the word at `offset`, within its paragraph.
+#[cfg(feature = "shared-parley")]
+fn word_at(text: &crate::styled_text::StyledText, offset: usize) -> core::ops::Range<usize> {
+    let (paragraph, paragraph_text) = text.paragraph_at(offset);
+    let local = offset.saturating_sub(paragraph.start).min(paragraph_text.len());
+    paragraph.start + prev_word_boundary(paragraph_text, local)
+        ..paragraph.start + next_word_boundary(paragraph_text, local)
 }
 
 /// The implementation of the `Text` element
@@ -2621,5 +2859,65 @@ pub unsafe extern "C" fn slint_cpp_text_item_fontmetrics(
         let self_rc = ItemRc::new(self_component.clone(), self_index);
         let self_ref = self_rc.borrow();
         core::ptr::write(out, slint_text_item_fontmetrics(window_adapter, self_ref, &self_rc));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clamp_selection, step_link_focus};
+    use crate::styled_text::{StyledText, StyledTextParagraph};
+
+    fn plain(text: &str) -> StyledText {
+        StyledText::from_paragraphs([StyledTextParagraph {
+            text: text.into(),
+            formatting: Default::default(),
+            links: Default::default(),
+        }])
+    }
+
+    #[test]
+    fn selection_is_clamped_when_the_text_shrinks_and_grows() {
+        // "ö" takes the bytes 7..9.
+        let long = plain("Hello wörld");
+        assert_eq!(clamp_selection(&long, 6, 11), 6..11);
+        assert_eq!(clamp_selection(&long, 11, 6), 6..11);
+        assert_eq!(clamp_selection(&long, 8, 6), 6..7);
+        assert_eq!(clamp_selection(&long, -4, 2), 0..2);
+        assert_eq!(clamp_selection(&long, i32::MAX, i32::MIN), 0..12);
+
+        // The element writes the clamped selection back when the text changes, so a selection
+        // past the end of a shorter text is kept at its end and not reset.
+        let short = plain("Hello");
+        let kept = clamp_selection(&short, 3, 11);
+        assert_eq!(kept, 3..5);
+        // The text grows again, as a streamed reply does: the selection stays where it was.
+        assert_eq!(clamp_selection(&long, kept.start as i32, kept.end as i32), 3..5);
+        assert_eq!(clamp_selection(&StyledText::default(), 3, 11), 0..0);
+    }
+
+    #[test]
+    fn tab_moves_through_links_in_order_and_leaves_at_the_ends() {
+        // Tab into the text focuses its first link, Shift+Tab its last.
+        assert_eq!(step_link_focus(None, 3, false), Some(0));
+        assert_eq!(step_link_focus(None, 3, true), Some(2));
+
+        let forward: alloc::vec::Vec<_> =
+            core::iter::successors(Some(0), |link| step_link_focus(Some(*link), 3, false))
+                .collect();
+        assert_eq!(forward, [0, 1, 2]);
+        let backward: alloc::vec::Vec<_> =
+            core::iter::successors(Some(2), |link| step_link_focus(Some(*link), 3, true))
+                .collect();
+        assert_eq!(backward, [2, 1, 0]);
+
+        // Past either end the key is left to the window, which moves the focus on.
+        assert_eq!(step_link_focus(Some(2), 3, false), None);
+        assert_eq!(step_link_focus(Some(0), 3, true), None);
+        // A text without links never takes the focus.
+        assert_eq!(step_link_focus(None, 0, false), None);
+        assert_eq!(step_link_focus(None, 0, true), None);
+        // A focused link that a text change removed.
+        assert_eq!(step_link_focus(Some(5), 2, true), Some(1));
+        assert_eq!(step_link_focus(Some(5), 2, false), None);
     }
 }

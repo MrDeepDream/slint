@@ -660,6 +660,9 @@ pub struct WindowInner {
     /// init code for the component might have code that sets the focus, but we don't want that
     /// for the ComponentContainer
     pub(crate) prevent_focus_change: Cell<bool>,
+    /// True while [`Self::focus_previous_item`] moves the focus, for an item that takes it in
+    /// steps, such as the links of a `StyledText`, to start from its last step.
+    pub(crate) focus_moving_backward: Cell<bool>,
     cursor_blinker: RefCell<pin_weak::rc::PinWeak<crate::input::TextCursorBlinker>>,
 
     pinned_fields: Pin<Box<WindowPinnedFields>>,
@@ -740,6 +743,7 @@ impl WindowInner {
             close_requested: Default::default(),
             click_state: ClickState::default(),
             prevent_focus_change: Default::default(),
+            focus_moving_backward: Default::default(),
             ctx: Default::default(),
             menubar: Default::default(),
             native_drag: Default::default(),
@@ -1665,8 +1669,10 @@ impl WindowInner {
                 },
             ),
         );
+        self.focus_moving_backward.set(true);
         let end_item =
             self.move_focus(start_item.clone(), previous_focus_item, FocusReason::TabNavigation);
+        self.focus_moving_backward.set(false);
         let window_adapter = self.window_adapter();
         if let Some(window_adapter) = window_adapter.internal(crate::InternalToken) {
             window_adapter.handle_focus_change(Some(start_item), end_item);

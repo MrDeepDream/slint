@@ -192,4 +192,21 @@ impl Layout {
 
         SelectionSpans(spans)
     }
+
+    /// The line boxes of the link at `index`, counting the links of all paragraphs in order, for
+    /// the lines that may reach `visible_band`. Empty when there is no such link.
+    pub(super) fn link_geometry(
+        &self,
+        index: usize,
+        visible_band: &Range<PhysicalLength>,
+    ) -> SelectionSpans {
+        self.paragraphs
+            .iter()
+            .flat_map(|paragraph| {
+                let start = paragraph.range.start;
+                paragraph.links.iter().map(move |(range, _)| start + range.start..start + range.end)
+            })
+            .nth(index)
+            .map_or_else(Default::default, |range| self.selection_geometry(range, visible_band))
+    }
 }

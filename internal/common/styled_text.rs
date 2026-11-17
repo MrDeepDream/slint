@@ -13,6 +13,13 @@ pub enum Style {
     Underline,
     // ARGB encoded
     Color(u32),
+    /// Draws the span with another font, given as a CSS `font-family` list such as
+    /// `"Segoe Fluent Icons, Segoe MDL2 Assets"`. Families that aren't installed or registered
+    /// are skipped, and characters none of them has fall back like any other text.
+    FontFamily(alloc::string::String),
+    /// Marks the span as decoration, such as an icon glyph in front of a link: it's drawn, but
+    /// left out of the copied text and of the text that assistive technologies read.
+    Ornament,
 }
 
 #[derive(Clone, Debug, PartialEq)]

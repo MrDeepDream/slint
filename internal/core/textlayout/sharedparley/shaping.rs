@@ -240,6 +240,16 @@ impl LayoutWithoutLineBreaksBuilder {
                             span.range,
                         );
                     }
+                    Style::FontFamily(families) => {
+                        builder.push(
+                            parley::style::FontFamily::Source(std::borrow::Cow::Borrowed(
+                                families.as_str(),
+                            )),
+                            span.range,
+                        );
+                    }
+                    // Drawn like the text around it; only copying and accessibility skip it.
+                    Style::Ornament => {}
                 }
             }
 
@@ -364,11 +374,16 @@ pub(super) fn create_text_paragraphs(
             }
         }
         PlainOrStyledText::Styled(rich_text) => {
+            // Ranges index the plain text, with one '\n' between paragraphs, which is what the
+            // selection and hit-testing offsets of a `StyledText` refer to.
+            let mut start = 0;
             for paragraph in rich_text.paragraphs {
+                let range = start..start + paragraph.text.len();
+                start = range.end + 1;
                 paragraphs.push(paragraph_from_text(
                     font_context,
                     &paragraph.text,
-                    0..0,
+                    range,
                     paragraph.formatting,
                     paragraph.links,
                 ));

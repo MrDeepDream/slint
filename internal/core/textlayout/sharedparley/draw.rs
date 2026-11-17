@@ -86,6 +86,62 @@ pub(super) fn visible_band(item_renderer: &impl GlyphRenderer) -> Range<Physical
     top..(top + clip.height_length() * scale_factor)
 }
 
+/// Corner radius of the box behind a hovered link, and of the inner edge of a focused link's ring.
+const LINK_BOX_RADIUS: LogicalLength = LogicalLength::new(3.0);
+/// Width of the ring around a focused link, which lies outside the link's box.
+pub const LINK_FOCUS_RING_WIDTH: LogicalLength = LogicalLength::new(2.0);
+
+/// Fills the line boxes of a link with `fill`, rounded, and draws a `ring` colored ring around
+/// each when one is set.
+pub(super) fn fill_link_boxes(
+    item_renderer: &mut impl GlyphRenderer,
+    boxes: &super::selection::SelectionSpans,
+    fill: Color,
+    ring: Option<Color>,
+) {
+    let scale_factor = item_renderer.scale_factor();
+    let radius = LINK_BOX_RADIUS * scale_factor;
+    let width = LINK_FOCUS_RING_WIDTH * scale_factor;
+    let ring = ring.and_then(|color| item_renderer.platform_brush_for_color(&color));
+    let fill = item_renderer.platform_brush_for_color(&fill);
+    for rect in boxes.backgrounds() {
+        if let Some(fill) = &fill {
+            item_renderer.fill_rectangle(rect, fill.clone(), radius, None);
+        }
+        let Some(ring) = &ring else { continue };
+        let outer = rect.inflate(width.get(), width.get());
+        match item_renderer.platform_brush_for_color(&Color::default()) {
+            Some(transparent) => item_renderer.fill_rectangle(
+                outer,
+                transparent,
+                radius + width,
+                Some(RectangleBorder { brush: ring.clone(), width }),
+            ),
+            // Renderers without a transparent brush get the ring as four square edges.
+            None => {
+                let (w, h) = (width.get(), outer.height() - 2. * width.get());
+                for edge in [
+                    PhysicalRect::new(outer.origin, PhysicalSize::new(outer.width(), w)),
+                    PhysicalRect::new(
+                        PhysicalPoint::new(outer.min_x(), outer.max_y() - w),
+                        PhysicalSize::new(outer.width(), w),
+                    ),
+                    PhysicalRect::new(
+                        PhysicalPoint::new(outer.min_x(), outer.min_y() + w),
+                        PhysicalSize::new(w, h),
+                    ),
+                    PhysicalRect::new(
+                        PhysicalPoint::new(outer.max_x() - w, outer.min_y() + w),
+                        PhysicalSize::new(w, h),
+                    ),
+                ] {
+                    item_renderer.fill_rectangle(edge, ring.clone(), PhysicalLength::zero(), None);
+                }
+            }
+        }
+    }
+}
+
 /// The horizontal counterpart of [`visible_band`].
 pub(super) fn visible_x_range(item_renderer: &impl GlyphRenderer) -> Range<PhysicalLength> {
     let scale_factor = item_renderer.scale_factor();

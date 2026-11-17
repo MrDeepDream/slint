@@ -1212,6 +1212,24 @@ fn build(l: &mut Loader) {
         in property <TextVerticalAlignment> vertical-alignment;
         /// A callback that's invoked when a link in the text is clicked. The parameter contains the clicked link as a string.
         callback link-clicked(link: string);
+        /// Where the selected text starts, as a byte offset into the plain text, which joins the paragraphs with one line break.
+        /// The user selects by dragging, by double-clicking a word or triple-clicking a paragraph, and with Ctrl+A.
+        /// A change of `text` keeps the selection, clamped to the new text.
+        in-out property <int> selection-start;
+        /// Where the selected text ends. See `selection-start`.
+        in-out property <int> selection-end;
+        /// The color of selected text. The default, transparent, keeps the text's own colors.
+        in property <color> selection-foreground-color;
+        /// The background of selected text. The default, transparent, draws no selection.
+        in property <color> selection-background-color;
+        /// The background of the link under the mouse pointer, with rounded corners.
+        in property <color> link-hover-color;
+        /// The color of the 2px ring around the link that has the keyboard focus.
+        /// Tab and Shift+Tab move the focus from link to link, and past the last or the first one to the next or the previous element.
+        /// Enter clicks the focused link.
+        in property <color> link-focus-color;
+        /// Invoked on Ctrl+C with the selected text, without the spans styled as ornaments. The element doesn't use the clipboard itself.
+        callback copy-requested(text: string);
     } }
 
     element! {
@@ -1260,7 +1278,7 @@ fn build(l: &mut Loader) {
         /// Math expressions |
         /// Other HTML tags  |
         /// \group:elements
-        @implicit_size
+        @accepts_focus @implicit_size
         StyledText: StyledTextItem
     }
 

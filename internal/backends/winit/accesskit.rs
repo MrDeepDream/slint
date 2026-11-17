@@ -17,7 +17,7 @@ use i_slint_core::accessibility::{
 use i_slint_core::api::Window;
 use i_slint_core::input::FocusReason;
 use i_slint_core::item_tree::{ItemTreeRc, ItemTreeRef, ItemTreeWeak};
-use i_slint_core::items::{ItemRc, WindowItem};
+use i_slint_core::items::{ItemRc, StyledTextItem, WindowItem};
 use i_slint_core::lengths::{LogicalPoint, ScaleFactor};
 use i_slint_core::window::{PopupWindowLocation, WindowInner};
 use i_slint_core::{properties::PropertyTracker, window::WindowAdapter};
@@ -146,6 +146,18 @@ impl AccessKitAdapter {
     }
 
     fn handle_request(&self, request: ActionRequest) -> Option<DeferredAccessKitAction> {
+        // A link of a `StyledText` is a sub-node of the text's node.
+        if matches!(request.action, Action::Click | Action::Focus)
+            && let Some((parent, sub_index)) = decode_sub_node_id(request.target_node)
+        {
+            let item = self.nodes.item_rc_for_node_id(parent)?;
+            item.downcast::<StyledTextItem>()?;
+            return Some(DeferredAccessKitAction::Link {
+                item,
+                index: sub_index as usize - 1,
+                click: request.action == Action::Click,
+            });
+        }
         let a = match request.action {
             Action::Click => AccessibilityAction::Default,
             Action::Focus => {
@@ -285,6 +297,15 @@ impl AccessKitAdapter {
                                     &mut emitted,
                                     &window_adapter,
                                 );
+                                emit_styled_text_links(
+                                    &item,
+                                    &mut node,
+                                    cached_node.id,
+                                    scale_factor,
+                                    Default::default(),
+                                    &mut emitted,
+                                    &window_adapter,
+                                );
 
                                 let mut out = Vec::with_capacity(1 + emitted.len());
                                 out.push((cached_node.id, node));
@@ -355,6 +376,53 @@ fn decode_sub_node_id(id: NodeId) -> Option<(NodeId, u32)> {
     (sub_index != 0).then_some((NodeId(id.0 & NODE_ID_PARENT_MASK), sub_index))
 }
 
+/// Emits a `Link` child of `node` for each link of a `StyledText`, named by the link's text, and
+/// gives `node` the text as its value when it has no label. Ornament spans are left out of both.
+fn emit_styled_text_links(
+    item: &ItemRc,
+    node: &mut Node,
+    id: NodeId,
+    scale_factor: ScaleFactor,
+    window_position: LogicalPoint,
+    link_nodes: &mut Vec<(NodeId, Node)>,
+    window_adapter: &std::rc::Rc<WinitWindowAdapter>,
+) {
+    let Some(styled) = item.downcast::<StyledTextItem>() else { return };
+    let styled = styled.as_pin_ref();
+    let text = styled.text();
+    if node.label().is_none() && node.value().is_none() {
+        node.set_value(text.plain_text(0..usize::MAX));
+    }
+    let geometry = item.geometry();
+    let origin = ((item.map_to_window(geometry.origin) + window_position.to_vector())
+        * scale_factor)
+        .cast::<f64>();
+    // Borrows the font context itself, so we must not be holding it here.
+    let bounds = i_slint_core::textlayout::sharedparley::styled_text_link_bounds(
+        window_adapter.renderer().as_core_renderer(),
+        styled,
+        item,
+        geometry.size,
+    );
+    for (index, (range, _)) in text.links().enumerate() {
+        let link_id = encode_sub_node_id(id, index as u32 + 1);
+        let mut link = Node::new(Role::Link);
+        link.set_label(text.plain_text(range));
+        if let Some(Some(rect)) = bounds.get(index) {
+            link.set_bounds(accesskit::Rect {
+                x0: origin.x + rect.min_x() as f64,
+                y0: origin.y + rect.min_y() as f64,
+                x1: origin.x + rect.max_x() as f64,
+                y1: origin.y + rect.max_y() as f64,
+            });
+        }
+        link.add_action(Action::Click);
+        link.add_action(Action::Focus);
+        node.push_child(link_id);
+        link_nodes.push((link_id, link));
+    }
+}
+
 fn is_text_input_role(role: Role) -> bool {
     matches!(
         role,
@@ -400,22 +468,36 @@ impl NodeCollection {
                     .borrow()
                     .upgrade()
                     .map(|focus_item| {
-                        let parent = nearest_accessible_item(focus_item);
-                        self.focused_node_tracker
-                            .as_ref()
-                            .evaluate(|| {
+                        let parent = nearest_accessible_item(focus_item.clone());
+                        let (delegate, link) = self.focused_node_tracker.as_ref().evaluate(|| {
+                            (
                                 parent.accessible_string_property(
                                     AccessibleStringProperty::DelegateFocus,
-                                )
-                            })
+                                ),
+                                focus_item.downcast::<StyledTextItem>().and_then(|text| {
+                                    let text = text.as_pin_ref();
+                                    text.focused_link_index()
+                                        .filter(|link| *link < text.text().links().count())
+                                }),
+                            )
+                        });
+                        let item = delegate
                             .and_then(|s| s.parse::<usize>().ok())
                             .and_then(|i| {
                                 i_slint_core::accessibility::accessible_descendents(&parent).nth(i)
                             })
-                            .unwrap_or(parent)
+                            .unwrap_or(parent);
+                        // The focused link of a text has a node of its own.
+                        let link = link.filter(|_| item == focus_item);
+                        (item, link)
                     })
-                    .or_else(|| window_inner.try_component().map(ItemRc::new_root))
-                    .map(|focus_item| self.find_node_id_by_item_rc(focus_item))
+                    .or_else(|| {
+                        window_inner.try_component().map(|root| (ItemRc::new_root(root), None))
+                    })
+                    .map(|(focus_item, link)| {
+                        let id = self.find_node_id_by_item_rc(focus_item);
+                        link.map_or(id, |link| encode_sub_node_id(id, link as u32 + 1))
+                    })
             })
             .unwrap_or(self.root_node_id)
     }
@@ -515,6 +597,15 @@ impl NodeCollection {
                 let mut n = self.build_node_without_children(&item, scale_factor, window_position);
                 n.set_children(descendant_children.clone());
                 self.try_emit_text_input_accessibility(
+                    &item,
+                    &mut n,
+                    id,
+                    scale_factor,
+                    window_position,
+                    &mut text_run_nodes,
+                    window_adapter,
+                );
+                emit_styled_text_links(
                     &item,
                     &mut n,
                     id,
@@ -988,6 +1079,12 @@ impl From<accesskit_winit::Event> for SlintEvent {
 pub enum DeferredAccessKitAction {
     SetFocus(ItemRc),
     InvokeAccessibleAction(ItemRc, AccessibilityAction),
+    /// Clicks or focuses the link at `index` of a `StyledText`.
+    Link {
+        item: ItemRc,
+        index: usize,
+        click: bool,
+    },
 }
 
 impl DeferredAccessKitAction {
@@ -999,6 +1096,15 @@ impl DeferredAccessKitAction {
             }
             DeferredAccessKitAction::InvokeAccessibleAction(item, accessibility_action) => {
                 item.accessible_action(accessibility_action);
+            }
+            DeferredAccessKitAction::Link { item, index, click } => {
+                let Some(text) = item.downcast::<StyledTextItem>() else { return };
+                if *click {
+                    text.as_pin_ref().activate_link(*index);
+                } else {
+                    let window_adapter = WindowInner::from_pub(window).window_adapter();
+                    text.as_pin_ref().focus_link(*index, &window_adapter, item);
+                }
             }
         }
     }

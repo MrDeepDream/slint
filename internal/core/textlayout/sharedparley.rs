@@ -72,7 +72,7 @@ mod shaping;
 mod tests;
 
 pub use cache::TextLayoutCache;
-pub use draw::{GlyphRenderer, RectangleBorder};
+pub use draw::{GlyphRenderer, LINK_FOCUS_RING_WIDTH, RectangleBorder};
 
 use cache::cached_paragraphs;
 use layout::{Layout, LayoutOptions, layout};
@@ -180,23 +180,18 @@ pub fn draw_text(
 
     let window_adapter = item_renderer.window().window_adapter();
 
-    let (horizontal_align, vertical_align) = text.alignment();
     let text_overflow = text.overflow();
     let text_color = text.color().color();
+    // Read before the cache entry is checked out, so that it isn't a dependency of the shaping:
+    // a selection, hover or focus change repaints, but never reshapes or re-breaks the text.
+    let interaction = text.interaction();
 
     let _ = with_text_layout(
         cache,
         item_rc,
         text,
         &layout_builder,
-        LayoutOptions {
-            horizontal_align,
-            vertical_align,
-            max_height: Some(max_height),
-            max_width: Some(max_width),
-            max_lines: text.line_limit(),
-            text_overflow,
-        },
+        render_text_layout_options(text, size),
         window_adapter.window(),
         |layout| {
             // When `overflow: elide` can't even fit the first line, the line is still drawn
@@ -219,91 +214,200 @@ pub fn draw_text(
             };
 
             if render {
+                let band = draw::visible_band(item_renderer);
+                let mut selection_spans = SelectionSpans::default();
+                if let Some(interaction) = &interaction {
+                    if let Some(link) = interaction.hovered_link {
+                        draw::fill_link_boxes(
+                            item_renderer,
+                            &layout.link_geometry(link, &band),
+                            interaction.link_hover_background,
+                            None,
+                        );
+                    }
+                    if !interaction.selection.is_empty()
+                        && interaction.selection_background.alpha() > 0
+                    {
+                        selection_spans =
+                            layout.selection_geometry(interaction.selection.clone(), &band);
+                    }
+                    for background in selection_spans.backgrounds() {
+                        item_renderer.fill_rectangle_with_color(
+                            background,
+                            interaction.selection_background,
+                        );
+                    }
+                }
+                let selection = interaction
+                    .as_ref()
+                    .filter(|interaction| {
+                        !selection_spans.is_empty() && interaction.selection_foreground.alpha() > 0
+                    })
+                    .and_then(|interaction| {
+                        item_renderer.platform_brush_for_color(&interaction.selection_foreground)
+                    })
+                    .map(|foreground| SelectionRendering { spans: &selection_spans, foreground });
+
                 layout.draw(
                     item_renderer,
                     platform_fill_brush,
                     platform_stroke_brush,
                     text_color,
-                    // `Text` has no selection today; the machinery is shared so wiring one up
-                    // later is a matter of passing spans here.
-                    None,
+                    selection.as_ref(),
                 );
             }
 
             if text_overflow == TextOverflow::Clip || clip_overflowing_first_line {
                 item_renderer.restore_state();
             }
+
+            // The ring lies around the link's box, so it's drawn past the text's clip.
+            if let Some((link, interaction)) = interaction
+                .as_ref()
+                .and_then(|interaction| Some((interaction.focused_link?, interaction)))
+            {
+                let band = draw::visible_band(item_renderer);
+                draw::fill_link_boxes(
+                    item_renderer,
+                    &layout.link_geometry(link, &band),
+                    Color::default(),
+                    Some(interaction.link_focus_color),
+                );
+            }
         },
     );
 }
 
-#[cfg(feature = "std")]
-pub fn link_under_cursor(
-    scale_factor: ScaleFactor,
+/// The layout options `draw_text` lays `text` out with in a box of `size`. Everything that asks
+/// the drawn layout a question uses them too, so that it hits the cache entry and the line
+/// breaking that drawing left behind.
+fn render_text_layout_options(
+    text: Pin<&dyn crate::item_rendering::RenderText>,
+    size: LogicalSize,
+) -> LayoutOptions {
+    let (horizontal_align, vertical_align) = text.alignment();
+    LayoutOptions {
+        horizontal_align,
+        vertical_align,
+        max_height: Some(size.height_length()),
+        max_width: Some(size.width_length()),
+        max_lines: text.line_limit(),
+        text_overflow: text.overflow(),
+    }
+}
+
+/// Hit-tests `text` laid out as it's drawn in a box of `size`: returns the byte offset in its
+/// plain text nearest to `position` (in item coordinates), and the index of the link under
+/// `position`, if any, counting links in the order of the text. `None` without a window.
+pub fn styled_text_hit_test(
+    renderer: &(impl RendererSealed + ?Sized),
     text: Pin<&dyn crate::item_rendering::RenderText>,
     item_rc: &crate::item_tree::ItemRc,
     size: LogicalSize,
-    cursor: PhysicalPoint,
-    window: &crate::api::Window,
-    cache: Option<&TextLayoutCache>,
-) -> Option<std::string::String> {
+    position: LogicalPoint,
+) -> Option<(usize, Option<usize>)> {
+    let scale_factor = renderer.scale_factor()?;
+    let window_adapter = renderer.window_adapter()?;
     let layout_builder = shaping_builder(text, Some(item_rc), text.wrap(), scale_factor);
-
-    let (horizontal_align, vertical_align) = text.alignment();
-
+    let cursor = position * scale_factor;
     with_text_layout(
-        cache,
+        renderer.text_layout_cache(),
         Some(item_rc),
         text,
         &layout_builder,
-        LayoutOptions {
-            horizontal_align,
-            vertical_align,
-            max_height: Some(size.height_length()),
-            max_width: Some(size.width_length()),
-            max_lines: text.line_limit(),
-            text_overflow: text.overflow(),
-        },
-        window,
-        |layout| link_in_layout(layout, cursor),
+        render_text_layout_options(text, size),
+        window_adapter.window(),
+        |layout| (layout.byte_offset_from_point(cursor).0, link_in_layout(layout, cursor)),
     )
-    .flatten()
 }
 
-fn link_in_layout(layout: &Layout, cursor: PhysicalPoint) -> Option<std::string::String> {
-    layout.paragraph_by_y(cursor.y_length()).and_then(|paragraph| {
-        let paragraph_y: f64 = paragraph.y.cast::<f64>().get();
+/// The box around each link of `text` laid out as it's drawn in a box of `size`, in the order of
+/// the text, in physical pixels relative to the item: the union of the boxes of its lines.
+/// `None` for a link that has no line.
+pub fn styled_text_link_bounds(
+    renderer: &(impl RendererSealed + ?Sized),
+    text: Pin<&dyn crate::item_rendering::RenderText>,
+    item_rc: &crate::item_tree::ItemRc,
+    size: LogicalSize,
+) -> Vec<Option<PhysicalRect>> {
+    let (Some(scale_factor), Some(window_adapter)) =
+        (renderer.scale_factor(), renderer.window_adapter())
+    else {
+        return Vec::new();
+    };
+    let layout_builder = shaping_builder(text, Some(item_rc), text.wrap(), scale_factor);
+    with_text_layout(
+        renderer.text_layout_cache(),
+        Some(item_rc),
+        text,
+        &layout_builder,
+        render_text_layout_options(text, size),
+        window_adapter.window(),
+        |layout| {
+            layout
+                .paragraphs
+                .iter()
+                .flat_map(|paragraph| {
+                    let top = (layout.y_offset + paragraph.y).get();
+                    paragraph.links.iter().map(move |(range, _)| {
+                        let mut bounds: Option<parley::BoundingBox> = None;
+                        link_selection(paragraph, range).geometry_with(
+                            &paragraph.layout,
+                            |rect, _line| bounds = Some(bounds.map_or(rect, |b| b.union(rect))),
+                        );
+                        bounds.map(|b| {
+                            PhysicalRect::new(
+                                PhysicalPoint::new(b.x0 as f32, b.y0 as f32 + top),
+                                PhysicalSize::new(b.width() as f32, b.height() as f32),
+                            )
+                        })
+                    })
+                })
+                .collect()
+        },
+    )
+    .unwrap_or_default()
+}
 
-        paragraph
-            .links
-            .iter()
-            .find(|(range, _)| {
-                let start = parley::editing::Cursor::from_byte_index(
-                    &paragraph.layout,
-                    range.start,
-                    Default::default(),
-                );
-                let end = parley::editing::Cursor::from_byte_index(
-                    &paragraph.layout,
-                    range.end,
-                    Default::default(),
-                );
-                let mut clicked = false;
-                let link_range = parley::Selection::new(start, end);
-                link_range.geometry_with(&paragraph.layout, |mut bounding_box, _line| {
+fn link_selection(paragraph: &shaping::TextParagraph, range: &Range<usize>) -> parley::Selection {
+    parley::Selection::new(
+        parley::editing::Cursor::from_byte_index(&paragraph.layout, range.start, Default::default()),
+        parley::editing::Cursor::from_byte_index(&paragraph.layout, range.end, Default::default()),
+    )
+}
+
+/// The index of the link under `cursor`, counting the links of all paragraphs in order.
+fn link_in_layout(layout: &Layout, cursor: PhysicalPoint) -> Option<usize> {
+    let paragraph = layout.paragraph_by_y(cursor.y_length())?;
+    let paragraph_y = (layout.y_offset + paragraph.y).cast::<f64>().get();
+    let point = parley::BoundingBox::new(
+        cursor.x.into(),
+        cursor.y.into(),
+        cursor.x.into(),
+        cursor.y.into(),
+    );
+    let links_before: usize = layout
+        .paragraphs
+        .iter()
+        .take_while(|p| !core::ptr::eq(*p, paragraph))
+        .map(|p| p.links.len())
+        .sum();
+    paragraph
+        .links
+        .iter()
+        .position(|(range, _)| {
+            let mut hit = false;
+            link_selection(paragraph, range).geometry_with(
+                &paragraph.layout,
+                |mut bounding_box, _line| {
                     bounding_box.y0 += paragraph_y;
                     bounding_box.y1 += paragraph_y;
-                    clicked = bounding_box.union(parley::BoundingBox::new(
-                        cursor.x.into(),
-                        cursor.y.into(),
-                        cursor.x.into(),
-                        cursor.y.into(),
-                    )) == bounding_box;
-                });
-                clicked
-            })
-            .map(|(_, link)| link.clone())
-    })
+                    hit |= bounding_box.union(point) == bounding_box;
+                },
+            );
+            hit
+        })
+        .map(|index| links_before + index)
 }
 
 pub fn draw_text_input(
