@@ -244,6 +244,8 @@ pub struct StyledTextItem {
     pub default_color: Property<Brush>,
     pub default_font_size: Property<LogicalLength>,
     pub default_font_family: Property<SharedString>,
+    pub default_font_weight: Property<i32>,
+    pub line_height_factor: Property<f32>,
     pub horizontal_alignment: Property<TextHorizontalAlignment>,
     pub vertical_alignment: Property<TextVerticalAlignment>,
     pub max_lines: Property<i32>,
@@ -542,10 +544,11 @@ impl HasFont for StyledTextItem {
         crate::items::WindowItem::resolved_font_request(
             self_rc,
             self.default_font_family(),
-            Default::default(),
+            // The base weight; `Strong` spans override it with bold when shaping.
+            self.default_font_weight(),
             self.default_font_size(),
             Default::default(),
-            1.0,
+            self.line_height_factor(),
             Default::default(),
         )
     }

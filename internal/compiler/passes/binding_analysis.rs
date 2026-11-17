@@ -1072,12 +1072,17 @@ fn visit_implicit_layout_info_dependencies(
             vis(&NamedReference::new(item, SmolStr::new_static("text")).into(), N);
             vis(&NamedReference::new(item, SmolStr::new_static("default-font-family")).into(), N);
             vis(&NamedReference::new(item, SmolStr::new_static("default-font-size")).into(), N);
+            vis(&NamedReference::new(item, SmolStr::new_static("default-font-weight")).into(), N);
             // A line dropped by the limit is also excluded from the content widths, so
             // `max-lines` is a dependency of both orientations, not just the height.
             vis(&NamedReference::new(item, SmolStr::new_static("max-lines")).into(), N);
             if orientation == Orientation::Vertical {
                 // StyledText always word-wraps, so its height depends on the width.
                 vis(&NamedReference::new(item, SmolStr::new_static("width")).into(), N);
+                vis(
+                    &NamedReference::new(item, SmolStr::new_static("line-height-factor")).into(),
+                    N,
+                );
             }
         }
 

@@ -1,0 +1,84 @@
+// Copyright © SixtyFPS GmbH <info@slint.dev>
+// SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
+
+// A variable font, so that every weight has its own glyph widths.
+import "../../../internal/common/sharedfontique/Inter-VariableFont.ttf";
+
+export component TestCase inherits Window {
+    width: 500phx;
+    height: 500phx;
+    default-font-size: 20px;
+
+    VerticalLayout {
+        alignment: start;
+
+        natural := StyledText {
+            text: @markdown("One\n\nTwo");
+            default-font-family: "Inter";
+        }
+
+        tall := StyledText {
+            text: @markdown("One\n\nTwo");
+            default-font-family: "Inter";
+            line-height-factor: 1.6;
+        }
+
+        light := StyledText {
+            text: @markdown("Wide words");
+            default-font-family: "Inter";
+            default-font-weight: 300;
+        }
+
+        heavy := StyledText {
+            text: @markdown("Wide words");
+            default-font-family: "Inter";
+            default-font-weight: 700;
+        }
+
+        light-strong := StyledText {
+            text: @markdown("**Wide words**");
+            default-font-family: "Inter";
+            default-font-weight: 300;
+        }
+    }
+
+    out property <length> natural-height: natural.preferred-height;
+    out property <length> tall-height: tall.preferred-height;
+    out property <length> light-width: light.preferred-width;
+    out property <length> heavy-width: heavy.preferred-width;
+    out property <length> light-strong-width: light-strong.preferred-width;
+
+    // Two lines at 1.6 times the natural line height. Text-block heights are rounded up to
+    // whole physical pixels, so the product can differ by up to 2 pixels.
+    out property <bool> test: natural.preferred-height > 0
+        && Math.abs((tall.preferred-height - 1.6 * natural.preferred-height) / 1phx) < 2
+        // The default weight reaches the runs, and a strong span still sets bold, which is 700.
+        && light.preferred-width < heavy.preferred-width
+        && Math.abs((light-strong.preferred-width - heavy.preferred-width) / 1phx) < 1;
+}
+
+/*
+```rust
+let instance = TestCase::new().unwrap();
+assert!(
+    instance.get_test(),
+    "heights {} -> {}, widths light {} heavy {} light+strong {}",
+    instance.get_natural_height(),
+    instance.get_tall_height(),
+    instance.get_light_width(),
+    instance.get_heavy_width(),
+    instance.get_light_strong_width(),
+);
+```
+
+```cpp
+auto handle = TestCase::create();
+const TestCase &instance = *handle;
+assert(instance.get_test());
+```
+
+```js
+let instance = new slint.TestCase({});
+assert(instance.test);
+```
+*/
