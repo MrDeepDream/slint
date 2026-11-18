@@ -1110,6 +1110,11 @@ pub struct InternalKeyEvent {
     /// isn't provided.
     #[cfg(target_os = "windows")]
     pub text_without_modifiers: SharedString,
+    /// The Latin letter, `a` to `z`, printed on this key of a US keyboard. A layout that types
+    /// another script, such as Cyrillic, puts another letter in `key_event.text`, so shortcuts
+    /// like Ctrl+V would never match. When Ctrl is held, `use_latin_key` puts this letter in the
+    /// text instead. Empty when the backend does not know the key's place or the key is no letter.
+    pub latin_key: SharedString,
     /// If the event type is KeyEventType::UpdateComposition or KeyEventType::CommitComposition,
     /// then this field specifies what part of the current text to replace.
     /// Relative to the offset of the pre-edit text within the text input element's text.
@@ -1125,6 +1130,19 @@ pub struct InternalKeyEvent {
 }
 
 impl InternalKeyEvent {
+    /// Puts `latin_key` in the text of a key pressed with Ctrl whose text is not ASCII, so that
+    /// shortcuts match on every layout, as native Windows and macOS controls do. Call it once the
+    /// modifiers are set: an AltGr combination has no Ctrl by then, and keeps the letter it types.
+    /// A Latin layout such as AZERTY or Dvorak types ASCII and keeps its own letters.
+    pub fn use_latin_key(&mut self) {
+        if self.key_event.modifiers.control
+            && !self.latin_key.is_empty()
+            && !self.key_event.text.is_ascii()
+        {
+            self.key_event.text = core::mem::take(&mut self.latin_key);
+        }
+    }
+
     /// If a shortcut was pressed, this function returns `Some(StandardShortcut)`.
     /// Otherwise it returns None.
     pub fn shortcut(&self) -> Option<StandardShortcut> {
@@ -2893,6 +2911,33 @@ mod touch_tests {
 mod tests {
     use super::*;
     extern crate alloc;
+
+    #[test]
+    fn test_use_latin_key() {
+        let event = |text: &str, control: bool, latin: &str| {
+            let mut event = InternalKeyEvent {
+                key_event: KeyEvent {
+                    text: text.into(),
+                    modifiers: KeyboardModifiers { control, ..Default::default() },
+                    ..Default::default()
+                },
+                latin_key: latin.into(),
+                ..Default::default()
+            };
+            event.use_latin_key();
+            event
+        };
+        // Ctrl+V on a Russian layout types "м", and pastes.
+        let pasted = event("м", true, "v");
+        assert_eq!(pasted.key_event.text, "v");
+        assert!(matches!(pasted.shortcut(), Some(StandardShortcut::Paste)));
+        // Without Ctrl, the key types its own letter.
+        assert_eq!(event("м", false, "v").key_event.text, "м");
+        // A Latin layout keeps its letter: Ctrl+Z on AZERTY is the key at the US "w" place.
+        assert_eq!(event("z", true, "w").key_event.text, "z");
+        // A key with no Latin letter keeps its text.
+        assert_eq!(event("ё", true, "").key_event.text, "ё");
+    }
 
     #[test]
     fn test_to_string() {

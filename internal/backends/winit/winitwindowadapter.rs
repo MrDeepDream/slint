@@ -150,6 +150,58 @@ fn test_round_up_logical() {
     assert_eq!(round_up_logical(21., 0.1), 25.);
 }
 
+/// The Latin letter printed on the key at `key`'s place on a US keyboard, or an empty string for
+/// a key that is no letter (see `InternalKeyEvent::latin_key`).
+fn latin_key(key: winit::keyboard::PhysicalKey) -> SharedString {
+    use winit::keyboard::{KeyCode as K, PhysicalKey};
+    const LETTERS: [(K, &str); 26] = [
+        (K::KeyA, "a"),
+        (K::KeyB, "b"),
+        (K::KeyC, "c"),
+        (K::KeyD, "d"),
+        (K::KeyE, "e"),
+        (K::KeyF, "f"),
+        (K::KeyG, "g"),
+        (K::KeyH, "h"),
+        (K::KeyI, "i"),
+        (K::KeyJ, "j"),
+        (K::KeyK, "k"),
+        (K::KeyL, "l"),
+        (K::KeyM, "m"),
+        (K::KeyN, "n"),
+        (K::KeyO, "o"),
+        (K::KeyP, "p"),
+        (K::KeyQ, "q"),
+        (K::KeyR, "r"),
+        (K::KeyS, "s"),
+        (K::KeyT, "t"),
+        (K::KeyU, "u"),
+        (K::KeyV, "v"),
+        (K::KeyW, "w"),
+        (K::KeyX, "x"),
+        (K::KeyY, "y"),
+        (K::KeyZ, "z"),
+    ];
+    let PhysicalKey::Code(code) = key else {
+        return SharedString::default();
+    };
+    LETTERS
+        .iter()
+        .find(|(letter, _)| *letter == code)
+        .map_or_else(SharedString::default, |(_, text)| (*text).into())
+}
+
+#[test]
+fn test_latin_key() {
+    use winit::keyboard::{KeyCode, NativeKeyCode, PhysicalKey};
+    assert_eq!(latin_key(PhysicalKey::Code(KeyCode::KeyA)), "a");
+    assert_eq!(latin_key(PhysicalKey::Code(KeyCode::KeyV)), "v");
+    assert_eq!(latin_key(PhysicalKey::Code(KeyCode::KeyZ)), "z");
+    assert_eq!(latin_key(PhysicalKey::Code(KeyCode::Digit1)), "");
+    assert_eq!(latin_key(PhysicalKey::Code(KeyCode::Semicolon)), "");
+    assert_eq!(latin_key(PhysicalKey::Unidentified(NativeKeyCode::Unidentified)), "");
+}
+
 /// Whether the platform assigns the window its size, so requesting one is pointless.
 ///
 /// On iOS and friends the window covers whatever the system hands it, and winit's UIKit
@@ -1421,6 +1473,7 @@ impl WinitWindowAdapter {
                     event_type,
                     #[cfg(target_os = "windows")]
                     text_without_modifiers,
+                    latin_key: latin_key(event.physical_key),
                     ..Default::default()
                 };
 
