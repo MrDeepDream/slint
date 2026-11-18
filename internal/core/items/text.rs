@@ -258,14 +258,14 @@ pub struct StyledTextItem {
     pub link_hover_color: Property<Color>,
     pub link_focus_color: Property<Color>,
     pub copy_requested: Callback<StringArg>,
+    /// Whether the left button went down on the text and is still down.
+    pub pressed: Property<bool>,
+    pub has_focus: Property<bool>,
     pub cached_rendering_data: CachedRenderingData,
     /// One more than the index of the link under the pointer, 0 for none.
     hovered_link: Property<usize>,
     /// One more than the index of the link that has the keyboard focus, 0 for none.
     focused_link: Property<usize>,
-    has_focus: Property<bool>,
-    /// Whether the left button went down on the text and is still down.
-    pressed: Cell<bool>,
     /// What the press selected, which a drag extends: the pressed offset, or the word or
     /// paragraph a double or triple press selected.
     press_start: Cell<usize>,
@@ -376,7 +376,7 @@ impl Item for StyledTextItem {
             #[cfg(feature = "shared-parley")]
             MouseEvent::Moved { position, .. } => {
                 let hit = hit(position);
-                if self.pressed.get() {
+                if self.pressed() {
                     if let Some((offset, _)) = hit {
                         self.set_selection(
                             self.press_start.get().min(offset)..self.press_end.get().max(offset),

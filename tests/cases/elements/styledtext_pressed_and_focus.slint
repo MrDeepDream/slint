@@ -1,0 +1,60 @@
+// Copyright © SixtyFPS GmbH <info@slint.dev>
+// SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
+
+export component TestCase inherits Window {
+    width: 300phx;
+    height: 100phx;
+
+    VerticalLayout {
+        alignment: start;
+
+        styled := StyledText {
+            text: @markdown("Pressed and focused text");
+        }
+    }
+
+    out property <bool> pressed: styled.pressed;
+    out property <bool> focused: styled.has-focus;
+    // What `pressed` was when the selection last changed, as a drag changes it.
+    out property <bool> pressed-at-select;
+    property <int> selection-end: styled.selection-end;
+    changed selection-end => {
+        root.pressed-at-select = styled.pressed;
+    }
+}
+
+/*
+```rust
+use slint::{platform::WindowEvent, platform::PointerEventButton, LogicalPosition};
+
+let instance = TestCase::new().unwrap();
+assert!(!instance.get_pressed());
+assert!(!instance.get_focused());
+
+instance.window().dispatch_event(WindowEvent::PointerPressed { position: LogicalPosition::new(5.0, 5.0), button: PointerEventButton::Left });
+assert!(instance.get_pressed());
+assert!(instance.get_focused());
+
+instance.window().dispatch_event(WindowEvent::PointerMoved { position: LogicalPosition::new(80.0, 5.0) });
+slint_testing::mock_elapsed_time(16);
+assert!(instance.get_pressed());
+assert!(instance.get_pressed_at_select());
+
+instance.window().dispatch_event(WindowEvent::PointerReleased { position: LogicalPosition::new(80.0, 5.0), button: PointerEventButton::Left });
+assert!(!instance.get_pressed());
+assert!(instance.get_focused());
+```
+
+```cpp
+auto handle = TestCase::create();
+const TestCase &instance = *handle;
+assert(!instance.get_pressed());
+assert(!instance.get_focused());
+```
+
+```js
+let instance = new slint.TestCase({});
+assert(!instance.pressed);
+assert(!instance.focused);
+```
+*/

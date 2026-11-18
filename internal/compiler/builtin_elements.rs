@@ -1223,6 +1223,10 @@ fn build(l: &mut Loader) {
         in-out property <int> selection-start;
         /// Where the selected text ends. See `selection-start`.
         in-out property <int> selection-end;
+        /// Whether the left mouse button went down on the text and is still down, as while the user drags out a selection.
+        out property <bool> pressed;
+        /// Whether the element has the keyboard focus.
+        out property <bool> has-focus;
         /// The color of selected text. The default, transparent, keeps the text's own colors.
         in property <color> selection-foreground-color;
         /// The background of selected text. The default, transparent, draws no selection.
